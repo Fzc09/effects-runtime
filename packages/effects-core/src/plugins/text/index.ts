@@ -5,3 +5,4 @@ export * from './text-layout';
 export * from './text-style';
 export * from './text-loader';
 export * from './text-component-base';
+export * from './text-rasterization';

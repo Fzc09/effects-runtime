@@ -1,3 +1,4 @@
+import { getHostItemGeometry } from '../host-policy';
 import { EventEmitter, type Engine, type Composition, type InputEventMouseButton, type Region, spec, type VFXItem, TextComponent, SpriteComponent, FrameComponent, addItem } from '@galacean/effects';
 import { VideoComponent } from '@galacean/effects-plugin-multimedia';
 import { RichTextComponent } from '@galacean/effects-plugin-rich-text';
@@ -92,7 +93,7 @@ export class Selection extends EventEmitter<SelectionEvents> {
    * @param engine Effects 引擎
    * @param hoveringResults 共享的预选状态
    */
-  constructor (engine: Engine, hoveringResults: HoveringResults = {}) {
+  constructor (engine: Engine, hoveringResults: HoveringResults = {}, private readonly hostFilter?: (item: VFXItem) => boolean) {
     super();
     this.engine = engine;
     this.hoveringResults = hoveringResults;
@@ -196,7 +197,7 @@ export class Selection extends EventEmitter<SelectionEvents> {
   getSelectedPlayerItems (): VFXItem[] {
     return this._selectedIds
       .map(id => getPlayerItemById(this.engine.sceneServer.compositions[0], id))
-      .filter((item): item is VFXItem => !!item);
+      .filter((item): item is VFXItem => !!item && (this.hostFilter?.(item) ?? true));
   }
 
   /**
@@ -411,7 +412,20 @@ export class Selection extends EventEmitter<SelectionEvents> {
       return isPlayerItemVisible(item);
     });
     this.refreshResultRegions(result);
-    const selectedIds = this.reorderHitTestResult(result, playerComposition).filter(id => id !== 'extra-camera' && !this.ignoreIds.includes(id) && !this.isIgnoredNameById(id) && getPlayerItemById(this.engine.sceneServer.compositions[0], id)?.type !== spec.ItemType.composition);
+    // Invisible renderer-free nodes (for example host Nulls) have no engine hit region.
+    // Use the exact same transformed rectangle as hover, handles and marquee selection.
+    const containerSize = GizmoViewportUtils.getContainerSize(this.engine.canvas.parentElement!);
+    const geometryHits = getItemChildren(playerComposition.sceneRoot).filter(item => {
+      if (!isPlayerItemVisible(item) || !getHostItemGeometry(item)) { return false; }
+      const transform = getItemViewTransform(item, containerSize);
+
+      return !!transform && transformedBoxContainsPoint(transform, point);
+    }).sort((a, b) => b.renderOrder - a.renderOrder).map(item => item.getInstanceId());
+    const selectedIds = Array.from(new Set([...this.reorderHitTestResult(result, playerComposition), ...geometryHits])).filter(id => {
+      const item = getPlayerItemById(playerComposition, id);
+
+      return !this.hostFilter || (!!item && this.hostFilter(item));
+    }).filter(id => id !== 'extra-camera' && !this.ignoreIds.includes(id) && !this.isIgnoredNameById(id) && getPlayerItemById(this.engine.sceneServer.compositions[0], id)?.type !== spec.ItemType.composition);
 
     return this.preSelectedFrameOutBound(point, selectedIds);
   }
@@ -983,7 +997,8 @@ export class Selection extends EventEmitter<SelectionEvents> {
 
     return isGroupPlayerItem(item)
       && !this.ignoreIds.includes(id)
-      && !this.isIgnoredNameById(id);
+      && !this.isIgnoredNameById(id)
+      && (this.hostFilter?.(item) ?? true);
   }
 
   /**
@@ -996,7 +1011,8 @@ export class Selection extends EventEmitter<SelectionEvents> {
 
     return item.type !== spec.ItemType.composition
       && !this.ignoreIds.includes(id)
-      && !this.isIgnoredNameById(id);
+      && !this.isIgnoredNameById(id)
+      && (this.hostFilter?.(item) ?? true);
   }
 
   /**
@@ -1054,6 +1070,11 @@ export class Selection extends EventEmitter<SelectionEvents> {
     // 从后向前处理，使本次交互最后加入的目标覆盖已有祖先或后代。
     for (let index = uniqueIds.length - 1; index >= 0; index--) {
       const id = uniqueIds[index];
+      const item = itemById.get(id);
+
+      if (this.hostFilter && (!item || !this.hostFilter(item))) {
+        continue;
+      }
       const ancestorIds: string[] = [];
       let parent = itemById.get(id)?.parent;
 

@@ -33,6 +33,7 @@ export class GPUTextureWebGL extends GPUTexture {
   target: GLenum = 0;
 
   private sourceType?: TextureSourceType;
+  private dataAllocation?: { width: number, height: number, internalformat: GLenum, format: GLenum, type: GLenum };
 
   bind (force?: boolean): void {
     if (!this.textureBuffer) {
@@ -68,6 +69,10 @@ export class GPUTextureWebGL extends GPUTexture {
     const gl = (this.device as RenderingDeviceWebGL).gl;
     const { detail } = (this.device as RenderingDeviceWebGL).gpuCapability;
     const { sourceType } = source;
+
+    if (sourceType !== TextureSourceType.data) {
+      this.dataAllocation = undefined;
+    }
     const { data } = source as Texture2DSourceOptionsData;
     const { cube } = source as TextureCubeSourceOptionsImage;
     const { image } = source as Texture2DSourceOptionsImage;
@@ -332,12 +337,24 @@ export class GPUTextureWebGL extends GPUTexture {
         )
         : bufferView;
 
-    gl.texImage2D(target, level, internalformat, width, height, 0, format, type, neoBuffer);
+    const previous = this.dataAllocation;
+    const reusable = target === gl.TEXTURE_2D && level === 0 && this.sourceType === TextureSourceType.data;
+
+    if (reusable && previous && previous.width === width && previous.height === height
+      && previous.internalformat === internalformat && previous.format === format && previous.type === type) {
+      gl.texSubImage2D(target, level, 0, 0, width, height, format, type, neoBuffer);
+    } else {
+      gl.texImage2D(target, level, internalformat, width, height, 0, format, type, neoBuffer);
+    }
+    if (reusable) {
+      this.dataAllocation = { width, height, internalformat, format, type };
+    }
 
     return [width, height];
   }
 
   override offloadData () {
+    this.dataAllocation = undefined;
     if (!this.initialized) {
       return;
     }
@@ -377,6 +394,7 @@ export class GPUTextureWebGL extends GPUTexture {
   }
 
   protected override onReleaseGPU (): void {
+    this.dataAllocation = undefined;
     if (this.textureBuffer) {
       const device = this.device as RenderingDeviceWebGL;
 

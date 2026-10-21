@@ -1,9 +1,11 @@
-import type { GLType, MessageItem, PointerEvent, Region } from '@galacean/effects-core';
+import type { GLType, MessageItem, PointerEvent, Region, TextRasterizationOptions } from '@galacean/effects-core';
 
 /**
  * player 创建的构造参数
  */
 export interface PlayerConfig {
+  /** 运行时文本栅格化限制，保留文档原有布局尺寸。 */
+  textRasterization?: TextRasterizationOptions,
   /**
    * 播放器的容器，会在容器中创建 canvas，container 和 canvas 必传一个
    */

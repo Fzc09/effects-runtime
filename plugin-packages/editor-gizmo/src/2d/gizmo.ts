@@ -27,6 +27,12 @@ export abstract class Gizmo {
     // 子类按需释放资源。
   }
 
+  /** Cancel any draft, including a pen path between pointer gestures. */
+  onCancel (_reason: string): void { }
+
+  /** 切换工具或编辑模式前，是否必须结束当前预览。 */
+  get cancelOnToolChange (): boolean { return false; }
+
   /** 在每帧更新时同步内部渲染状态。 */
   onUpdate (): void {
     // 子类按需同步渲染状态。

@@ -6,13 +6,17 @@ const { expect } = chai;
 describe('core/plugins/text/text-item', () => {
   let engine: Engine;
   let textComponent: TextComponent;
+  let measureText: CanvasRenderingContext2D['measureText'];
 
   beforeEach(() => {
     engine = new Engine(document.createElement('canvas'));
     textComponent = new VFXItem(engine).addComponent(TextComponent);
+    measureText = textComponent.context!.measureText;
   });
 
   afterEach(() => {
+    // 画布会回到共享池，测量桩不能泄漏到后续组件和测试。
+    textComponent.context!.measureText = measureText;
     textComponent.dispose();
     engine.dispose();
   });

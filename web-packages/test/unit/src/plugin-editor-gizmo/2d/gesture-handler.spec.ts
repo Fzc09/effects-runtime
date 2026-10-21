@@ -1,4 +1,4 @@
-import { InputEventKey, InputEventMouseButton, MouseButton, MouseButtonMask, type InputEventMouse } from '@galacean/effects';
+import { InputEventKey, InputEventMouseButton, MouseButton, MouseButtonMask, Transform, type InputEventMouse } from '@galacean/effects';
 import { restoreTestState, getSpyCalls, resetSpy } from '../helpers/spies';
 import { VideoComponent } from '@galacean/effects-plugin-multimedia';
 
@@ -20,6 +20,8 @@ import { HandGizmoTool, ImageCutGizmoTool, MoveGizmoTool } from '../../../../../
 import type { EditMode } from '../../../../../../plugin-packages/editor-gizmo/src/2d/modes';
 import { DefaultSelectionMode, EffectsEditMode, TextEditMode } from '../../../../../../plugin-packages/editor-gizmo/src/2d/modes';
 import type { GizmoViewport } from '../../../../../../plugin-packages/editor-gizmo/src/2d/viewport/gizmo-viewport';
+import type { GizmoHostPolicy, GizmoTransformSessionEvent } from '../../../../../../plugin-packages/editor-gizmo/src/2d/host-policy';
+import { TransformType } from '../../../../../../plugin-packages/editor-gizmo/src/2d/gizmos/resize-selection-gizmo/transform-types';
 
 const { expect } = chai;
 
@@ -54,7 +56,7 @@ describe('plugin-editor-gizmo/gesture-handler', () => {
     return (handler as unknown as { gizmoViewport: GizmoViewport }).gizmoViewport;
   }
 
-  function createHandler (): GestureHandler {
+  function createHandler (hostPolicy: GizmoHostPolicy = {}): GestureHandler {
     const container = document.createElement('div');
 
     document.body.appendChild(container);
@@ -67,7 +69,7 @@ describe('plugin-editor-gizmo/gesture-handler', () => {
       canvas,
       sceneServer: { compositions: [] },
     } as unknown as Engine;
-    const handler = new GestureHandler(engine);
+    const handler = new GestureHandler(engine, hostPolicy);
 
     // 生产路径由宿主 projection 在派发前交付完整图；测试夹具也遵守同一生命周期。
     activateMode(handler, []);
@@ -1240,6 +1242,7 @@ describe('GestureHandler - mouse lifecycle and captured owner', () => {
 
     return {
       type,
+      onCancel: chai.spy(),
       dispose () {},
       requiresDragThreshold: () => true,
       onMouseLeave () {},
@@ -2015,6 +2018,177 @@ describe('GestureHandler - mouse lifecycle and captured owner', () => {
     expect(getSpyCalls(report).some(args => args.length === 3 && args[0] instanceof Error && args[1] === 'gizmo-actionstart' && args[2]?.gizmoType === 'throwing' && Object.keys(args[2]).length === 1)).to.equal(true);
     handler.dispose();
   });
+
+  it('取消回调再次抛错时仍上报原始异常并释放交互状态', () => {
+    const handler = createHandler();
+    const report = chai.spy();
+    const original = new Error('original drag failure');
+    const cleanup = new Error('cleanup failure');
+    const throwing = makeStub('throwing', {
+      onMouseDrag () { throw original; },
+      onCancel () { throw cleanup; },
+      requiresDragThreshold: () => false,
+    });
+
+    handler.setErrorMonitor({ report });
+    activateStubs(handler, [throwing]);
+    setCapturedGizmo(handler, throwing);
+    handler.setSelectionTransformKind('resize');
+    expect(() => dispatchMouse(handler, mouseMotion(new MouseEvent('mousemove', {
+      buttons: 1, clientX: 20, clientY: 20,
+    })))).not.to.throw();
+    const errors = getSpyCalls(report).map(args => args[0]);
+
+    expect(errors).includes(original).and.includes(cleanup);
+    expect(capturedGizmo(handler)).equals(undefined);
+    expect(handler.getSelectionTransformKind()).equals('idle');
+    handler.dispose();
+  });
+
+  it('一帧内仅执行最新绘制，取消和销毁会移除待执行绘制', async () => {
+    const handler = createHandler();
+    const source = makeStub('draw-source', {});
+    const draws: number[] = [];
+    const frame = () => new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+
+    for (let index = 0; index < 12; index++) {
+      handler.requestDraw(source, () => draws.push(index));
+    }
+    expect(draws).deep.equals([]);
+    await frame();
+    expect(draws).deep.equals([11]);
+    handler.requestDraw(source, () => draws.push(12));
+    handler.cancelInteraction();
+    await frame();
+    expect(draws).deep.equals([11]);
+    handler.requestDraw(source, () => draws.push(13));
+    handler.dispose();
+    await frame();
+    expect(draws).deep.equals([11]);
+  });
+
+  it('异步绘制和取消同时失败时仍清理并上报', async () => {
+    const handler = createHandler();
+    const report = chai.spy();
+    const original = new Error('draw failure');
+    const cleanup = new Error('draw cleanup failure');
+    const source = makeStub('draw-source', { onCancel () { throw cleanup; } });
+
+    handler.setErrorMonitor({ report });
+    setCapturedGizmo(handler, source);
+    handler.setSelectionTransformKind('resize');
+    handler.requestDraw(source, () => { throw original; });
+    await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+    expect(getSpyCalls(report).map(args => args[0])).includes(original).and.includes(cleanup);
+    expect(capturedGizmo(handler)).equals(undefined);
+    expect(handler.getSelectionTransformKind()).equals('idle');
+    handler.dispose();
+  });
+
+  for (const phase of ['drag', 'draw', 'key', 'cleanup-error'] as const) {
+    it(`事务交互在 ${phase} 异常后回滚并只结束一次，后续交互仍可提交`, async () => {
+      const handler = createHandler({ transactionalTransforms: true });
+      const transform = new Transform({ position: [1, 2, 3], scale: [1, 2, 1] });
+      const item = { transform, getInstanceId: () => 'transaction-item' } as VFXItem;
+      const original = new Error('transaction update failed');
+      const cleanup = new Error('transaction cleanup failed');
+      const notification = new Error('transaction notification failed');
+      const errors: unknown[] = [];
+      const events: { type: string, event: GizmoTransformSessionEvent }[] = [];
+      const failCleanup = phase === 'cleanup-error';
+      const update = () => handler.emit('actionupdate', { source, transformType: TransformType.SCALE });
+      const source = makeStub('transaction-source', {
+        requiresDragThreshold: () => false,
+        onMouseDrag: update,
+        onKeyDown: update,
+        onMouseUp: () => handler.emit('actioncommit', { source, transformType: TransformType.SCALE }),
+        onCancel: chai.spy(() => { if (failCleanup) { throw cleanup; } }),
+      });
+
+      activateStubs(handler, [source]);
+      chai.spy.on(handler.getSelection(), 'getSelectedPlayerItems', () => [item]);
+      if (failCleanup) { chai.spy.on(console, 'error', () => {}); }
+      handler.setErrorMonitor({
+        report (error) {
+          errors.push(error);
+          if (failCleanup) { throw new Error('reporter failed'); }
+        },
+      });
+      for (const type of ['transformstart', 'transformupdate', 'transformcommit', 'transformcancel'] as const) {
+        handler.on(type, event => {
+          events.push({ type, event });
+          if (type === 'transformcancel' && failCleanup) { throw notification; }
+        });
+      }
+      handler.on('actionupdate', () => { throw original; });
+      try {
+        handler.emit('actionstart', { source, transformType: TransformType.SCALE });
+        setCapturedGizmo(handler, source);
+        handler.setSelectionTransformKind('resize');
+        transform.setPosition(20, 30, 40);
+        transform.setScale(3, 4, 5);
+        const pendingDraw = chai.spy();
+
+        handler.requestDraw(source, pendingDraw);
+        if (phase === 'drag') {
+          expect(() => dispatchMouse(handler, mouseMotion(new MouseEvent('mousemove', {
+            buttons: 1, clientX: 20, clientY: 20,
+          })))).not.to.throw();
+        } else if (phase === 'key') {
+          expect(() => inputViewport(handler).onKeyDown(createKeyboardInput('KeyA'))).not.to.throw();
+        } else {
+          handler.requestDraw(source, update);
+        }
+        await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+        expect(pendingDraw).not.to.have.been.called;
+        expect(events.map(({ type }) => type)).deep.equals(['transformstart', 'transformupdate', 'transformcancel']);
+        expect(events[2].event).deep.equals({
+          sessionId: events[0].event.sessionId,
+          before: events[0].event.before,
+          after: events[0].event.before,
+          reason: 'gizmo-error',
+        });
+        expect([transform.position.x, transform.position.y, transform.position.z]).deep.equals([1, 2, 3]);
+        expect([transform.scale.x, transform.scale.y, transform.scale.z]).deep.equals([1, 2, 1]);
+        expect((handler as unknown as { transformSession?: unknown }).transformSession).equals(undefined);
+        expect(capturedGizmo(handler)).equals(undefined);
+        expect(handler.getSelectionTransformKind()).equals('idle');
+        expect(source.onCancel).to.have.been.called.once;
+        expect(errors).includes(original);
+        if (failCleanup) { expect(errors).includes(cleanup).and.includes(notification); }
+        dispatchMouse(handler, mouseButton(false));
+        expect(events.length).equals(3);
+        handler.emit('actionstart', { source, transformType: TransformType.SCALE });
+        handler.emit('actioncommit', { source, transformType: TransformType.SCALE });
+        expect(events.slice(3).map(({ type }) => type)).deep.equals(['transformstart', 'transformcommit']);
+        expect(events[3].event.sessionId).greaterThan(events[0].event.sessionId);
+      } finally {
+        handler.dispose();
+        transform.dispose();
+      }
+    });
+  }
+
+  for (const target of ['window', 'canvas']) {
+    it(`${target} 失焦立即取消文本交互，销毁后移除监听`, () => {
+      const handler = createHandler();
+      const source = makeStub('text-resize', { cancelOnToolChange: true });
+      const eventTarget = target === 'window' ? window : handler.getEngine().canvas;
+
+      activateStubs(handler, [source]);
+      setCapturedGizmo(handler, source);
+      handler.setSelectionTransformKind('resize');
+      eventTarget.dispatchEvent(new Event('blur'));
+      expect(source.onCancel).to.have.been.called.with('blur');
+      expect(capturedGizmo(handler)).equals(undefined);
+      expect(handler.getSelectionTransformKind()).equals('idle');
+      handler.dispose();
+      chai.spy.on(handler, 'cancelInteraction');
+      setCapturedGizmo(handler, source);
+      eventTarget.dispatchEvent(new Event('blur'));
+      expect(handler.cancelInteraction).not.to.have.been.called;
+    });
+  }
 
   it('onKeyDown 隔离抛错：上报 gizmo-key 且不向上抛', () => {
     const handler = createHandler();

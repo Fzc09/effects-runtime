@@ -87,6 +87,53 @@ describe('webgl/gl-texture', () => {
     expect(() => gpu.initialize({})).to.throw();
   });
 
+  for (const failingMethod of ['texImage2D', 'texParameteri'] as const) {
+    it(`releases partial GPU allocations after ${failingMethod} fails and permits retry`, () => {
+      const texture = new Texture(engine, { data: { width: 2, height: 2, data: new Uint8Array(16) } });
+      const gpu = texture.getGPUTexture() as GPUTextureWebGL;
+      const { createTexture, deleteTexture } = gl;
+      const originalMethod = gl[failingMethod];
+      const created: WebGLTexture[] = [];
+      const deleted: (WebGLTexture | null)[] = [];
+      const failure = new Error('initialization failed');
+
+      gl.createTexture = () => {
+        const handle = createTexture.call(gl)!;
+
+        created.push(handle);
+
+        return handle;
+      };
+      gl.deleteTexture = handle => { deleted.push(handle); deleteTexture.call(gl, handle); };
+      gl[failingMethod] = () => { throw failure; };
+      try {
+        expect(() => texture.initialize()).to.throw(failure);
+        expect(gpu.isInitialized).equals(false);
+        expect(gpu.textureBuffer).equals(null);
+        expect([gpu.width, gpu.height]).deep.equals([0, 0]);
+        expect(created.length).equals(1);
+        expect(deleted.length).equals(1);
+        expect(deleted[0]).equals(created[0]);
+        expect(gl.isTexture(created[0])).equals(false);
+        Object.assign(gl, { [failingMethod]: originalMethod });
+        texture.initialize();
+        expect(texture.getGPUTexture()).equals(gpu);
+        expect(gpu.isInitialized).equals(true);
+        expect(created.length).equals(2);
+        expect(gl.isTexture(created[1])).equals(true);
+        expect(gl.getError()).equals(gl.NO_ERROR);
+        texture.dispose();
+        texture.dispose();
+        expect(deleted.length).equals(2);
+        expect(deleted[1]).equals(created[1]);
+        expect(gl.isTexture(created[1])).equals(false);
+      } finally {
+        Object.assign(gl, { createTexture, deleteTexture, [failingMethod]: originalMethod });
+        texture.dispose();
+      }
+    });
+  }
+
   it('preserves source-based updates and upload-time source mutation', () => {
     const device = engine.displayServer.renderingDevice;
     const previous = device.doNotHandleContextLost;

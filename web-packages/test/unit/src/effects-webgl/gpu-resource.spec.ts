@@ -104,33 +104,40 @@ describe('webgl/gpu-resource', () => {
     expect(device['resources'].length).equals(baseline);
   });
 
-  it('releases the previous allocation and propagates initialization errors', () => {
+  it('releases previous and failed allocations, propagates the error and permits retry', () => {
     const texture = device.createTexture();
 
     texture.initialize(source);
     const previous = texture.textureBuffer;
     let releases = 0;
     const deleted: Array<WebGLTexture | null> = [];
-    const deleteTexture = gl.deleteTexture.bind(gl);
+    const deleteTexture = gl.deleteTexture;
     const upload = gl.texImage2D;
 
     texture.on('releasing', () => releases++);
-    gl.deleteTexture = handle => { deleted.push(handle); deleteTexture(handle); };
+    gl.deleteTexture = handle => { deleted.push(handle); deleteTexture.call(gl, handle); };
     gl.texImage2D = () => { throw new Error('upload failed'); };
-    expect(() => texture.initialize(source)).to.throw('upload failed');
-    gl.texImage2D = upload;
-    gl.deleteTexture = deleteTexture;
-    expect(releases).equals(1);
-    expect(deleted.length).equals(1);
-    expect(deleted[0]).equals(previous);
-    const failedHandle = texture.textureBuffer;
-
-    expect(failedHandle).to.be.instanceOf(WebGLTexture);
-    expect(gl.isTexture(failedHandle)).equals(true);
-    expect(texture.isInitialized).equals(false);
-    expect(texture.device).equals(device);
-    // Fatal upload errors discard the context; afterEach releases this test's context.
-    texture.dispose();
+    try {
+      expect(() => texture.initialize(source)).to.throw('upload failed');
+      expect(releases).equals(1);
+      expect(deleted.length).equals(2);
+      expect(deleted[0]).equals(previous);
+      for (const handle of deleted) {
+        expect(gl.isTexture(handle)).equals(false);
+        expect(Object.values(device.textureUnitDict)).not.to.include(handle);
+      }
+      expect(texture.textureBuffer).equals(null);
+      expect(texture.isInitialized).equals(false);
+      expect(texture.device).equals(device);
+      gl.texImage2D = upload;
+      texture.initialize(source);
+      expect(readPixel(texture)).deep.equals([12, 34, 56, 255]);
+      expect(gl.getError()).equals(gl.NO_ERROR);
+    } finally {
+      gl.texImage2D = upload;
+      gl.deleteTexture = deleteTexture;
+      texture.dispose();
+    }
   });
 
   it('keeps the asset identity and source while its allocation is released and restored', () => {

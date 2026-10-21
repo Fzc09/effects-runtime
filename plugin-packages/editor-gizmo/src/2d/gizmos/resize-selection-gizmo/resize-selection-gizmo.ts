@@ -13,6 +13,7 @@ import { GestureCursorType, type GestureCursorResult } from '../../cursor';
 import {
   calculateAnchoredResize,
   type AnchoredResizeGeometry,
+  type AnchoredResizeOptions,
   type AnchoredResizeResult,
 } from './anchored-resize';
 import type { ResizeSelectionBehavior, ResizeSelectionConfig } from '../../configs/types';
@@ -83,6 +84,8 @@ type TextResizeSnapshot = {
   width: number,
   /** 初始排版高度。 */
   height: number,
+  /** 自适应重置大小 */
+  autoResize: spec.TextSizeMode,
 };
 
 /** 按下时冻结、用于计算绝对缩放结果的会话。 */
@@ -119,6 +122,8 @@ type AnchoredResizeSession = {
   lastAppliedPosition?: Vector3,
   /** 拖拽期间由外部布局累计写入的位置修正。 */
   externalTranslation?: Vector3,
+  /** 结束文本栅格化预览 */
+  endRasterizationPreview?: ReturnType<TextComponent['beginRasterizationPreview']>,
 };
 
 /** 缩放角点的桌面端命中区域边长；视觉手柄仍由 scaleCircleSize 控制。 */
@@ -474,6 +479,9 @@ export class ResizeSelectionGizmo extends Gizmo {
 
   /** 在每帧更新时刷新选区线框及失效的光标状态。 */
   override onUpdate () {
+    if (this.resizeSession && !this.resizeSession.item.isRegistered) {
+      this.onCancel('deleted');
+    }
     const lastActiveType = this.wireframe.activeType;
 
     this.refreshWireframeBySelectedItems();
@@ -811,6 +819,7 @@ export class ResizeSelectionGizmo extends Gizmo {
 
   /** 释放配置监听器。 */
   override dispose (): void {
+    this.onCancel('dispose');
     this.configOff?.();
     this.configOff = undefined;
     super.dispose();
@@ -818,6 +827,9 @@ export class ResizeSelectionGizmo extends Gizmo {
 
   /** @returns 当前是否存在可操作的选中元素。 */
   private isApplicableSelection (): boolean {
+    if (this._owner.getHostPolicy?.().canTransform?.(this.selectedItems) === false) {
+      return false;
+    }
     const selectedItems = this.selectedItems;
 
     return selectedItems.length >= 1 && !this.hasLoadingSelection(selectedItems);
@@ -875,7 +887,26 @@ export class ResizeSelectionGizmo extends Gizmo {
     }
 
     this.refreshCursorResult(activeType, cursorRotation);
+    this.refreshWireframeBySelectedItems();
     this.lastPoint.copyFrom(currentPoint);
+    const session = this.resizeSession;
+    const text = session?.text?.component;
+
+    if (session && text) {
+      const draw = () => {
+        // 松手、取消、删除或重载后，待执行的帧不能继续使用旧会话。
+        if (this.resizeSession === session && session.endRasterizationPreview?.isActive()
+          && session.item.isRegistered && text.isDirty) {
+          text.flushText();
+        }
+      };
+
+      if (this._owner.requestDraw) {
+        this._owner.requestDraw(this, draw);
+      } else {
+        draw();
+      }
+    }
     this._owner.emit('actionupdate', {
       source: this,
       transformType: this.wireframe.activeType,
@@ -889,19 +920,58 @@ export class ResizeSelectionGizmo extends Gizmo {
     const viewportPoint = this.cursorPoint.clone();
 
     this.initInteractionPlane(viewportPoint);
+    if (this.resizeSession?.text) {
+      this.resizeSession.endRasterizationPreview = this.resizeSession.text.component.beginRasterizationPreview();
+    }
     this.lastWorldPosition = viewPositionToWorld(viewportPoint, GizmoViewportUtils.getCameraInfo(this._owner.getEngine()), this.interactionPlane, GizmoViewportUtils.getContainerSize(this._owner.getEngine().canvas.parentElement!)) ?? new Vector3();
   }
 
   /** 清理一次变换算法运行态，不改写当前线框命中类型。 */
   private resetTransformOperation (): void {
+    const session = this.resizeSession;
+    const activeText = session?.endRasterizationPreview?.isActive() ? session.text?.component : undefined;
+
     if (this._owner.getSelectionTransformKind() === 'resize') {
       this._owner.setSelectionTransformKind('idle');
     }
     this.handlesActive = false;
     this._owner.getSnapManager().reset();
+    session?.endRasterizationPreview?.();
     this.resizeSession = undefined;
     this.lastPoint = new Vector2();
     this.cursorPoint = new Vector2();
+    // 即使播放器已暂停，也要呈现最终质量的文本或恢复的快照。
+    if (activeText) {
+      this.refreshWireframeBySelectedItems();
+      activeText.flushText();
+    }
+  }
+
+  /** 文本预览的资源预算模式不得在当前工具停用后继续生效。 */
+  override get cancelOnToolChange (): boolean {
+    return this.resizeSession?.text !== undefined;
+  }
+
+  /** 退出预览资源预算模式前，回滚已取消的文本编辑。 */
+  override onCancel (_reason: string): void {
+    const session = this.resizeSession;
+
+    if (!session && !this.handlesActive) { return; }
+    try {
+      if (session?.text && session.endRasterizationPreview?.isActive() !== false) {
+        const { component, width, height, fontSize, fontOffset, lineHeight, autoResize } = session.text;
+
+        // 恢复导入时的原值，避免编辑 setter 的钳制改变行高、字号或零高度。
+        component.textStyle.fontSize = fontSize;
+        component.textStyle.fontOffset = fontOffset;
+        Object.assign(component.textLayout, { width, height, lineHeight, autoResize });
+        session.item.transform.setPosition(...session.initialPosition.toArray());
+        session.item.transform.setScale(...session.initialScale.toArray());
+        component.refreshText();
+      }
+    } finally {
+      this.resetTransformOperation();
+    }
   }
 
   /**
@@ -1163,6 +1233,7 @@ export class ResizeSelectionGizmo extends Gizmo {
         lineHeight: textComponent.textLayout.lineHeight,
         width: textComponent.textLayout.width,
         height: textComponent.textLayout.height,
+        autoResize: textComponent.textLayout.autoResize,
       }
       : undefined;
 
@@ -1483,8 +1554,23 @@ export class ResizeSelectionGizmo extends Gizmo {
       return getVector2Angle(interactiveDirection);
     }
 
+    const resizeBehavior = session.resizeBehavior ?? 'scale';
+    const resizeAxis = getResizeAxis(resizeBehavior);
+    const isFreeScaleByDefault = isFramePlayerItem(session.item) || resizeBehavior === 'resize';
+    const isShiftFreeScale = isFreeScaleByDefault ? !event.shiftPressed : event.shiftPressed;
+    const lockAspectRatio = session.text
+      ? session.text.mode === 'font'
+      : resizeAxis === 'both' && this.isLockScale && !isShiftFreeScale;
+    const options: AnchoredResizeOptions = {
+      handleKind: session.handleKind,
+      lockAspectRatio,
+      lockedAxis: resizeAxis === 'x' ? 'y' : resizeAxis === 'y' ? 'x' : undefined,
+    };
     const handleView = pointerView.clone().subtract(session.pointerToHandleView);
-    const snappedHandleView = this.snapHandlePoint(handleView);
+    const constrained = session.handleKind === 'edge' || (lockAspectRatio && resizeAxis === 'both');
+    const constrainedHandle = constrained ? this.constrainHandlePoint(handleView, session, options) : handleView;
+    const direction = constrained ? constrainedHandle.clone().subtract(session.fixedPointView) : undefined;
+    const snappedHandleView = this.snapHandlePoint(constrainedHandle, direction);
     let targetHandleView = snappedHandleView;
 
     // 步骤 2：边手柄投影到单轴，并计算当前光标方向。
@@ -1519,19 +1605,8 @@ export class ResizeSelectionGizmo extends Gizmo {
       return getVector2Angle(cursorDirection);
     }
 
-    // 步骤 4：解析比例约束，计算并应用缩放结果。
-    const resizeBehavior = session.resizeBehavior ?? 'scale';
-    const resizeAxis = getResizeAxis(resizeBehavior);
-    const isFreeScaleByDefault = isFramePlayerItem(session.item) || resizeBehavior === 'resize';
-    const isShiftFreeScale = isFreeScaleByDefault ? !event.shiftPressed : event.shiftPressed;
-    const lockAspectRatio = session.text
-      ? session.text.mode === 'font'
-      : resizeAxis === 'both' && this.isLockScale && !isShiftFreeScale;
-    const resize = calculateAnchoredResize(session.geometry, handleWorld, {
-      handleKind: session.handleKind,
-      lockAspectRatio,
-      lockedAxis: resizeAxis === 'x' ? 'y' : resizeAxis === 'y' ? 'x' : undefined,
-    });
+    // 步骤 4：沿同一约束应用吸附后的缩放，避免比例锁定再次把手柄推离参考线。
+    const resize = calculateAnchoredResize(session.geometry, handleWorld, options);
 
     this.applyAnchoredResize(session, resize);
     this.lastWorldPosition.copyFrom(handleWorld);
@@ -1545,6 +1620,11 @@ export class ResizeSelectionGizmo extends Gizmo {
    * @param resize 绝对缩放结果。
    */
   private applyAnchoredResize (session: AnchoredResizeSession, resize: AnchoredResizeResult): void {
+    if (session.endRasterizationPreview?.isActive() === false) {
+      this.resetTransformOperation();
+
+      return;
+    }
     // 步骤 1：读取按下时冻结的元素属性。
     const { item, initialScale, initialWorldSize, initialLocalSize, text } = session;
 
@@ -1573,9 +1653,7 @@ export class ResizeSelectionGizmo extends Gizmo {
         );
         this.setResizePosition(session, resize.totalTranslation);
 
-        const composition = this._owner.getEngine().sceneServer.compositions[0];
-
-        composition?.gotoAndStop(composition.time);
+        text.component.refreshText();
 
         return;
       }
@@ -1601,9 +1679,7 @@ export class ResizeSelectionGizmo extends Gizmo {
       );
       this.setResizePosition(session, resize.totalTranslation);
 
-      const composition = this._owner.getEngine().sceneServer.compositions[0];
-
-      composition?.gotoAndStop(composition.time);
+      text.component.refreshText();
 
       return;
     }
@@ -1675,7 +1751,7 @@ export class ResizeSelectionGizmo extends Gizmo {
    * @param point 原始手柄位置。
    * @returns 吸附后的手柄位置。
    */
-  private snapHandlePoint (point: Vector2): Vector2 {
+  private snapHandlePoint (point: Vector2, direction?: Vector2): Vector2 {
     const snapManager = this._owner.getSnapManager();
 
     snapManager.clearSnappingVisualizations();
@@ -1685,10 +1761,66 @@ export class ResizeSelectionGizmo extends Gizmo {
 
     snapManager.preparePoint(new Vector2(), point);
 
+    if (direction) {
+      const correction = { x: snapManager.result.x, y: snapManager.result.y };
+      let closest: Vector2 | undefined;
+      let distance = snapManager.config.distance + 1e-6;
+
+      // 参考线与约束直线求交；使用实际手柄位移判断阈值，排除无法沿约束到达的吸附。
+      for (const axis of ['x', 'y'] as const) {
+        const delta = correction[axis];
+
+        if (delta === undefined || Math.abs(direction[axis]) < 1e-6) {
+          continue;
+        }
+        const offset = direction.clone().multiply(delta / direction[axis]);
+        const length = offset.length();
+
+        if (length <= distance) {
+          closest = point.clone().subtract(offset);
+          distance = length;
+        }
+      }
+      snapManager.clearSnappingVisualizations();
+      if (!closest) {
+        return point;
+      }
+      // 只显示最终实际重合的轴，不保留被比例或单轴约束舍弃的候选提示。
+      const xAligned = correction.x !== undefined && Math.abs(closest.x - point.x + correction.x) < 1e-6;
+      const yAligned = correction.y !== undefined && Math.abs(closest.y - point.y + correction.y) < 1e-6;
+
+      snapManager.preparePoint(new Vector2(), closest, undefined, xAligned, yAligned);
+
+      return closest;
+    }
+
     return point.clone().subtract(new Vector2(
       snapManager.result.x ?? 0,
       snapManager.result.y ?? 0,
     ));
+  }
+
+  /**
+   * 先计算比例/单轴约束后的实际手柄，再在视口空间查找可达的吸附目标。
+   * @param point 未约束的手柄视口坐标
+   * @param session 按下时冻结的会话
+   * @param options 缩放约束
+   */
+  private constrainHandlePoint (point: Vector2, session: AnchoredResizeSession, options: AnchoredResizeOptions): Vector2 {
+    const camera = GizmoViewportUtils.getCameraInfo(this._owner.getEngine());
+    const size = GizmoViewportUtils.getContainerSize(this._owner.getEngine().canvas.parentElement!);
+    const world = viewPositionToWorld(point, camera, this.interactionPlane, size);
+
+    if (!world) {
+      return point;
+    }
+    const resize = calculateAnchoredResize(session.geometry, world, options);
+    const { initialHandle, resizeOrigin, worldToLocalRotation } = session.geometry;
+    const handle = initialHandle.clone().subtract(resizeOrigin).applyMatrix(worldToLocalRotation)
+      .multiply(resize.totalScalar).applyMatrix(worldToLocalRotation.clone().invert())
+      .add(resizeOrigin).add(resize.totalTranslation).applyProjectionMatrix(camera.matrix.clone().invert());
+
+    return new Vector2((handle.x + 1) * size.x / 2, (1 - handle.y) * size.y / 2);
   }
 
 }

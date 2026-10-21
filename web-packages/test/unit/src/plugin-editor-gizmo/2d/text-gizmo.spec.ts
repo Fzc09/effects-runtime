@@ -39,6 +39,7 @@ describe('plugin-editor-gizmo/text-gizmo', () => {
       setTextHeight: TestSpy,
       setTextWidth: TestSpy,
       getLineCount: TestSpy,
+      flushText: TestSpy,
       textLayout: {
         lineHeight: number,
         letterSpace: number,
@@ -71,6 +72,7 @@ describe('plugin-editor-gizmo/text-gizmo', () => {
       setTextHeight: chai.spy(),
       setTextWidth: chai.spy(),
       getLineCount: chai.spy(() => 1),
+      flushText: chai.spy(),
     };
     let itemVisible = true;
     const item = {
@@ -167,7 +169,7 @@ describe('plugin-editor-gizmo/text-gizmo', () => {
 
   describe('TextGizmo - inline editing', () => {
     it('输入始终写入编辑会话持有的文本对象', () => {
-      const { gizmo, session, textComponent, emit } = createGizmo();
+      const { gizmo, session, textComponent, emit, owner } = createGizmo();
 
       expect(session.beginFromCurrentSelection('focus')).to.equal(true);
       gizmo.draw();
@@ -175,6 +177,8 @@ describe('plugin-editor-gizmo/text-gizmo', () => {
       gizmo.textAreaElement.dispatchEvent(new Event('input'));
 
       expect(textComponent.setText).to.have.been.called.with.exactly('after');
+      expect(textComponent.flushText).to.have.been.called.once;
+      expect(owner.getEngine().sceneServer.compositions[0].gotoAndStop).not.to.have.been.called();
       expect(emit).to.have.been.called.with.exactly('textinput', {
         source: gizmo,
         itemId: 'text-1',

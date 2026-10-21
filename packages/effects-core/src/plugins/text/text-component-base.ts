@@ -1,7 +1,7 @@
 import * as spec from '@galacean/effects-specification';
 import type { Engine } from '../../engine';
 import type { Material } from '../../material';
-import { Texture } from '../../texture';
+import { Texture, TextureSourceType } from '../../texture';
 import type { ItemRenderer } from '../../components';
 import type { VFXItem } from '../../vfx-item';
 import type { BaseLayout } from './base-layout';
@@ -37,6 +37,11 @@ export class TextComponentBase {
   // 常量
   protected readonly ALPHA_FIX_VALUE = 1 / 255;
 
+  /** 默认同时更新布局；普通文本可只使像素失效。 */
+  protected markTextureDirty (): void {
+    this.isDirty = true;
+  }
+
   /**
    * 设置文本内容
    * @param value - 文本内容
@@ -58,7 +63,7 @@ export class TextComponentBase {
       return;
     }
     this.textLayout.textAlign = value;
-    this.isDirty = true;
+    this.markTextureDirty();
   }
 
   /**
@@ -70,7 +75,7 @@ export class TextComponentBase {
       return;
     }
     this.textLayout.textVerticalAlign = value as unknown as spec.TextVerticalAlign;
-    this.isDirty = true;
+    this.markTextureDirty();
   }
 
   /**
@@ -95,7 +100,7 @@ export class TextComponentBase {
       return;
     }
     this.textStyle.textColor = value;
-    this.isDirty = true;
+    this.markTextureDirty();
   }
 
   /**
@@ -150,7 +155,7 @@ export class TextComponentBase {
       return;
     }
     this.textStyle.outlineColor = value;
-    this.isDirty = true;
+    this.markTextureDirty();
   }
 
   /**
@@ -162,7 +167,7 @@ export class TextComponentBase {
       return;
     }
     this.textStyle.isOutlined = value;
-    this.isDirty = true;
+    this.markTextureDirty();
   }
 
   /**
@@ -170,11 +175,11 @@ export class TextComponentBase {
    * @param value - 字体清晰度
    */
   setFontScale (value: number): void {
-    if (this.textStyle.fontScale === value) {
+    if (!Number.isFinite(value) || value <= 0 || this.textStyle.fontScale === value) {
       return;
     }
     this.textStyle.fontScale = value;
-    this.isDirty = true;
+    this.markTextureDirty();
   }
 
   /**
@@ -218,16 +223,17 @@ export class TextComponentBase {
     }
   }
 
-  protected setupShadow (): void {
+  protected setupShadow (effectiveScale = this.textStyle.fontScale, flipY = true): void {
     const context = this.context;
-    const { shadowColor, shadowBlur, shadowOffsetX, shadowOffsetY, fontScale } = this.textStyle;
+    const { shadowColor, shadowBlur, shadowOffsetX, shadowOffsetY } = this.textStyle;
     const [r, g, b, a] = shadowColor;
 
     if (context) {
       context.shadowColor = `rgba(${r * 255}, ${g * 255}, ${b * 255}, ${a})`;
-      context.shadowBlur = shadowBlur * fontScale;
-      context.shadowOffsetX = shadowOffsetX * fontScale;
-      context.shadowOffsetY = -shadowOffsetY * fontScale;
+      context.shadowBlur = shadowBlur * effectiveScale;
+      context.shadowOffsetX = shadowOffsetX * effectiveScale;
+      // Canvas 阴影偏移不受绘制变换影响。
+      context.shadowOffsetY = (flipY ? -1 : 1) * shadowOffsetY * effectiveScale;
     }
   }
 
@@ -245,6 +251,8 @@ export class TextComponentBase {
       return;
     }
 
+    // 避免共享画布池中的空闲画布保留大量像素存储。
+    this.canvas.width = this.canvas.height = 1;
     canvasPool.releaseCanvasAndContext({
       canvas: this.canvas,
       context: this.context,
@@ -262,7 +270,7 @@ export class TextComponentBase {
     height: number,
     flipY: boolean,
     drawCallback: (ctx: CanvasRenderingContext2D) => void,
-    options: { disposeOld?: boolean } = {}
+    options: { disposeOld?: boolean, reuse?: boolean } = {}
   ): void {
     if (!this.context || !this.canvas) {
       return;
@@ -272,43 +280,76 @@ export class TextComponentBase {
     const textureWidth = Math.max(1, width);
     const textureHeight = Math.max(1, height);
 
-    // 先保存状态
-    context.save();
-
-    // 设置canvas尺寸
-    this.canvas.width = textureWidth;
-    this.canvas.height = textureHeight;
-
-    //重置变换
-    context.setTransform(1, 0, 0, 1, 0, 0);
-
-    // 处理翻转
-    if (!flipY) {
-      context.translate(0, textureHeight);
-      context.scale(1, -1);
+    if (!Number.isSafeInteger(textureWidth) || !Number.isSafeInteger(textureHeight)) {
+      throw new RangeError('Invalid text texture size.');
     }
+    // 调整画布尺寸会重置整个上下文，包括已保存的状态栈。
+    if (this.canvas.width !== textureWidth) { this.canvas.width = textureWidth; }
+    if (this.canvas.height !== textureHeight) { this.canvas.height = textureHeight; }
+    context.save();
+    try {
 
-    // 在翻转后清空画布
-    context.clearRect(0, 0, textureWidth, textureHeight);
+      //重置变换
+      context.setTransform(1, 0, 0, 1, 0, 0);
+      context.globalAlpha = 1;
+      context.globalCompositeOperation = 'source-over';
+      context.direction = 'ltr';
+      context.textAlign = 'left';
+      context.textBaseline = 'alphabetic';
+      context.shadowColor = 'transparent';
+      context.shadowBlur = context.shadowOffsetX = context.shadowOffsetY = 0;
 
-    // 设置 alpha 修复用填充色（不实际输出像素）
-    context.fillStyle = `rgba(255, 255, 255, ${this.ALPHA_FIX_VALUE})`;
+      // 处理翻转
+      if (!flipY) {
+        context.translate(0, textureHeight);
+        context.scale(1, -1);
+      }
 
-    // 执行绘制回调
-    drawCallback(context);
+      // 在翻转后清空画布
+      context.clearRect(0, 0, textureWidth, textureHeight);
 
-    // 创建纹理前恢复状态
-    context.restore();
+      // 设置 alpha 修复用填充色（不实际输出像素）
+      context.fillStyle = `rgba(255, 255, 255, ${this.ALPHA_FIX_VALUE})`;
+
+      // 执行绘制回调
+      drawCallback(context);
+    } finally {
+      context.restore();
+    }
 
     // 创建新纹理
     const imageData = context.getImageData(0, 0, textureWidth, textureHeight);
+    // getImageData 返回独立的新缓冲区，后续画布绘制不会覆盖此视图中的数据；
+    // 启用上下文恢复时，Texture 会保留该缓冲区。
+    const data = {
+      data: new Uint8Array(imageData.data.buffer, imageData.data.byteOffset, imageData.data.byteLength),
+      width: imageData.width,
+      height: imageData.height,
+    };
+    const oldTexture = this.renderer.texture;
+
+    if (options.reuse && oldTexture && oldTexture !== this.engine.assetServer.whiteTexture
+      && !oldTexture.isDestroyed && oldTexture.getWidth() === textureWidth && oldTexture.getHeight() === textureHeight
+      && oldTexture.sourceType === TextureSourceType.data && oldTexture.source.target === glContext.TEXTURE_2D
+      && oldTexture.source.flipY === flipY && oldTexture.source.format === glContext.RGBA
+      && oldTexture.source.internalFormat === glContext.RGBA && oldTexture.source.type === glContext.UNSIGNED_BYTE
+      && oldTexture.source.wrapS === glContext.CLAMP_TO_EDGE && oldTexture.source.wrapT === glContext.CLAMP_TO_EDGE
+      && oldTexture.source.magFilter === glContext.LINEAR && oldTexture.source.minFilter === glContext.LINEAR) {
+      const previousSource = oldTexture.source;
+
+      try {
+        oldTexture.updateSource({ data });
+      } catch (error) {
+        oldTexture.source = previousSource;
+        throw error;
+      }
+      oldTexture.release();
+
+      return;
+    }
     const texture = Texture.createWithData(
       this.engine,
-      {
-        data: new Uint8Array(imageData.data),
-        width: imageData.width,
-        height: imageData.height,
-      },
+      data,
       {
         flipY,
         magFilter: glContext.LINEAR,
@@ -318,12 +359,19 @@ export class TextComponentBase {
       },
     );
 
-    // 根据选项决定是否释放旧纹理
-    if (options.disposeOld !== false) {
-      this.disposeTextTexture();
+    try {
+      texture.initialize();
+    } catch (error) {
+      texture.dispose();
+      throw error;
     }
+
+    // 根据选项决定是否释放旧纹理
     this.renderer.texture = texture;
     this.material.setTexture('_MainTex', texture);
+    if (options.disposeOld !== false && oldTexture && oldTexture !== this.engine.assetServer.whiteTexture) {
+      oldTexture.dispose();
+    }
   }
 
   // 初始化方法，由子类调用

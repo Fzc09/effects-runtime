@@ -88,6 +88,7 @@ describe('plugin-editor-gizmo/selection', () => {
         sceneServer: {
           compositions: [{
             items: [hidden, visible],
+            sceneRoot: makeItem('root', [hidden, visible]),
             hitTest: chai.spy(() => [
               { id: 'visible', position: new Vector3() },
               { id: 'hidden', position: new Vector3() },

@@ -10,8 +10,14 @@ export abstract class GPUTexture extends GPUResource {
 
   initialize (source: TextureSourceOptions): void {
     this.releaseGPU();
-    this.onInitialize(source);
-    this.initialized = true;
+    try {
+      this.onInitialize(source);
+      this.initialized = true;
+    } catch (error) {
+      // 初始化可能已经分配了句柄；releaseGPU 会跳过尚未初始化成功的资源。
+      this.onReleaseGPU();
+      throw error;
+    }
   }
 
   abstract update (source: TextureSourceOptions, options?: TextureSourceOptions): void;

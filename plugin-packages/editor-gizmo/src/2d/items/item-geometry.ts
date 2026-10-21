@@ -1,4 +1,5 @@
-import { FrameComponent, spec, type VFXItem } from '@galacean/effects';
+import { getHostItemGeometry } from '../host-policy';
+import { FrameComponent, ShapeComponent, spec, type VFXItem } from '@galacean/effects';
 import { Box2 } from '@galacean/effects-math/es/extension/index';
 import type { Matrix3 } from '../math';
 import { Euler, EulerOrder, Matrix4, Quaternion, Vector2, Vector3, getBoxTransform, getBoxTransformFromBox, getTransformedBox } from '../math';
@@ -24,32 +25,40 @@ export function getItemViewBox (item: VFXItem, containerSize: Vector2): Box2 {
  * @returns 有效变换；元素不可见或没有有效矩形时返回 undefined
  */
 export function getItemViewTransform (item: VFXItem, containerSize: Vector2): Matrix3 | undefined {
-  if (!item.isVisible || !supportsRect(item)) {
+  const geometry = getHostItemGeometry(item);
+
+  if (!item.isVisible || (!geometry && !supportsRect(item))) {
     return undefined;
   }
 
   const hasFrameComponent = !!item.getComponent(FrameComponent);
   let viewTransform: Matrix3 | undefined;
 
-  if (item.type !== spec.ItemType.null || hasFrameComponent) {
+  if (geometry || item.type !== spec.ItemType.null || hasFrameComponent) {
     const { transform, composition } = item;
 
     transform.updateLocalMatrix();
     const { x, y } = transform.size.clone().divide(2);
+    // Shape 的顶点已携带局部尺寸，transform.size 通常为 1；真实边界还可能偏离元素原点。
+    const shapeBounds = item.type === spec.ItemType.shape
+      ? item.getComponent(ShapeComponent)?.getBoundingBoxInfo().boundingBox
+      : undefined;
+    const min = geometry ? new Vector3(...geometry.min, 0) : shapeBounds?.minimum ?? new Vector3(-x, -y, 0);
+    const max = geometry ? new Vector3(...geometry.max, 0) : shapeBounds?.maximum ?? new Vector3(x, y, 0);
     const compositionMatrix = new Matrix4()
       .copyFrom(composition?.transform.getWorldMatrix() ?? new Matrix4())
       .invert();
     const itemWorldMatrix = compositionMatrix.multiply(transform.getWorldMatrix());
 
     viewTransform = getBoxTransform([
-      new Vector3(-x, y, 0),
-      new Vector3(x, y, 0),
-      new Vector3(x, -y, 0),
-      new Vector3(-x, -y, 0),
+      new Vector3(min.x, max.y, 0),
+      new Vector3(max.x, max.y, 0),
+      new Vector3(max.x, min.y, 0),
+      new Vector3(min.x, min.y, 0),
     ].map(point => projectPoint(point.applyMatrix(itemWorldMatrix), item, containerSize)));
   }
 
-  if (hasFrameComponent) {
+  if (hasFrameComponent || (geometry && !geometry.includeChildren)) {
     return viewTransform;
   }
 

@@ -14,6 +14,7 @@ import type { GLType } from './gl';
 import { EventEmitter } from './events';
 import { getClassesDerivedFrom } from './decorators';
 import { EngineServer } from './engine-server';
+import type { TextRasterizationOptions } from './plugins/text/text-rasterization';
 
 export interface EngineOptions extends WebGLContextAttributes {
   name?: string,
@@ -28,6 +29,8 @@ export interface EngineOptions extends WebGLContextAttributes {
    * Engine 是否拥有 canvas 的生命周期，默认 true。
    */
   ownsCanvas?: boolean,
+  /** 运行时文本栅格化限制，独立于文档的布局尺寸。 */
+  textRasterization?: TextRasterizationOptions,
   /**
    * 是否不处理 WebGL 上下文丢失恢复。
    * - `true`（默认）：上传 GPU 后释放 CPU 端源数据以节省内存；上下文丢失后不自动恢复，

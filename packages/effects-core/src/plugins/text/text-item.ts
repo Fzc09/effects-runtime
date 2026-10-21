@@ -11,6 +11,8 @@ import { TextLayout } from './text-layout';
 import { TextStyle } from './text-style';
 import { TextComponentBase } from './text-component-base';
 import type { Renderer } from '../../render/renderer';
+import { getTextRasterSize, resolveTextRasterizationOptions, TextRasterizationPreviewState } from './text-rasterization';
+import type { TextRasterizationOptions, TextRasterizationPreview } from './text-rasterization';
 
 export const DEFAULT_FONTS = [
   'serif',
@@ -47,7 +49,65 @@ let seed = 0;
  */
 @effectsClass(spec.DataType.TextComponent)
 export class TextComponent extends MaskableGraphic {
-  isDirty = true;
+  private dirty = true;
+  private layoutDirty = true;
+  private textDestroyed = false;
+  private rasterizationOptions: TextRasterizationOptions = {};
+  private readonly rasterizationPreview = new TextRasterizationPreviewState();
+
+  get isDirty (): boolean { return this.dirty; }
+  set isDirty (value: boolean) {
+    this.dirty = value;
+    if (value) {
+      this.layoutDirty = true;
+    }
+  }
+
+  // 实例方法避免通用 mixin 覆盖普通文本的布局失效策略。
+  protected markTextureDirty = (): void => {
+    this.dirty = true;
+  };
+
+  get rasterizationMode (): 'normal' | 'preview' {
+    return this.rasterizationPreview.mode;
+  }
+
+  /** 仅在运行时生效的限制；未指定的值沿用引擎策略。 */
+  setRasterizationOptions (options: TextRasterizationOptions): void {
+    resolveTextRasterizationOptions(this.engine.options.textRasterization, options);
+    this.rasterizationOptions = { ...options };
+    this.markTextureDirty();
+  }
+
+  /**
+   * 临时使用 previewMaxPixels 预算栅格化后续更新，适用于连续修改字号、尺寸或样式。
+   * 开始预览不触发重绘；结束时仅在生成过预览纹理后标记待刷新，下次更新恢复正常预算。
+   * 需要立即更新纹理时由调用方执行 flushText。
+   * 同一组件仅保留最新预览；新预览、fromData 或销毁都会使旧句柄失效。
+   */
+  beginRasterizationPreview (): TextRasterizationPreview {
+    return this.rasterizationPreview.begin(() => { this.markTextureDirty(); });
+  }
+
+  /** 同步刷新布局和几何数据；由宿主决定何时更新像素或绘制。 */
+  refreshText (): void {
+    if (this.textDestroyed) {
+      return;
+    }
+    this.isDirty = true;
+    this.updateLayout();
+  }
+
+  /** 同步完成最新文本的像素更新，可选择在不推进播放时间的情况下呈现。 */
+  flushText (present = true): void {
+    if (this.textDestroyed || this.engine.disposed || this.engine.displayServer.renderingDevice.contextWasLost) {
+      return;
+    }
+    this.updateTexture();
+    if (present) {
+      this.engine.onDraw();
+    }
+  }
   /**
    * 文本行数
    */
@@ -90,8 +150,10 @@ export class TextComponent extends MaskableGraphic {
 
   override onUpdate (dt: number): void {
     super.onUpdate(dt);
-    this.updateTexture();
+    this.updateMaterialSize();
+  }
 
+  private updateMaterialSize (): void {
     // 覆盖基类每帧更新 size 行为，应用扩容比例
     for (const material of this.materials) {
       let sizeX = this.transform.size.x;
@@ -106,19 +168,50 @@ export class TextComponent extends MaskableGraphic {
   }
 
   override render (renderer: Renderer) {
+    this.prepareTextForRender();
     this.maskManager.drawStencilMask(renderer, this);
 
     renderer.drawGeometry(this.geometry, this.transform.getWorldMatrix(), this.material);
   }
 
+  override drawStencilMask (maskRef: number): void {
+    if (!this.isActiveAndEnabled) { return; }
+    this.prepareTextForRender();
+    super.drawStencilMask(maskRef);
+  }
+
+  private prepareTextForRender (): void {
+    try {
+      this.updateTexture();
+    } catch (error) {
+      // 保留原纹理，让场景中的其他内容继续绘制。
+      console.error('Text render update failed.', error);
+    }
+  }
+
   override onDestroy (): void {
+    if (this.textDestroyed) {
+      return;
+    }
+    this.textDestroyed = true;
+    this.rasterizationPreview.dispose();
     super.onDestroy();
     this.disposeTextTexture();
     this.releaseTextCanvas();
   }
 
+  override dispose (): void {
+    super.dispose();
+    // 组件可能在所属元素初始化之前就被释放。
+    if (!this.textDestroyed) { this.onDestroy(); }
+  }
+
   override fromData (data: spec.TextComponentData): void {
+    const previousTexture = this.renderer.texture;
+
     super.fromData(data);
+    this.renderer.texture = previousTexture;
+    this.material.setTexture('_MainTex', previousTexture);
     const { interaction, options } = data;
 
     this.interaction = interaction;
@@ -134,8 +227,7 @@ export class TextComponent extends MaskableGraphic {
   }
 
   private resetState (): void {
-    // 清理纹理资源
-    this.disposeTextTexture();
+    this.rasterizationPreview.reset();
 
     // 重置状态变量
     this.isDirty = true;
@@ -161,6 +253,7 @@ export class TextComponent extends MaskableGraphic {
     }
 
     this.text = options.text.toString();
+    this.isDirty = true;
   }
 
   /**
@@ -169,6 +262,7 @@ export class TextComponent extends MaskableGraphic {
    * @returns 行数
    */
   getLineCount (text: string): number {
+    this.validateMetrics();
     const context = this.context;
     const { letterSpace, overflow } = this.textLayout;
 
@@ -287,6 +381,7 @@ export class TextComponent extends MaskableGraphic {
    * @param value - 行高像素值
    */
   setLineHeight (value: number): void {
+    if (!Number.isFinite(value)) { return; }
     const fontSize = this.textStyle.fontSize;
     //设置行高不能小于字号大小
     const safe = Math.max(fontSize, value);
@@ -299,29 +394,76 @@ export class TextComponent extends MaskableGraphic {
     this.isDirty = true;
   }
 
-  /**
-   * 更新文本
-   */
-  protected updateTexture (flipY = true): void {
-    if (!this.isDirty || !this.context || !this.canvas) {
-      return;
-    }
-
+  /** 读取边界前更新逻辑布局，不进行栅格化，也不跳转合成时间。 */
+  updateLayout (): void {
+    if (this.textDestroyed || !this.layoutDirty) { return; }
+    this.validateMetrics();
     const style = this.textStyle;
     const layout = this.textLayout;
-    let fontScale = style.fontScale;
+    const { width, height } = layout;
+    const { lineCount, maxLineWidth } = this;
 
-    if (layout.autoResize === spec.TextSizeMode.autoWidth) {
-      layout.width = this.getTextWidth();
-      this.lineCount = this.getLineCount(this.text);
-      layout.height = layout.lineHeight * this.lineCount;
-    } else if (layout.autoResize === spec.TextSizeMode.autoHeight) {
-      this.lineCount = this.getLineCount(this.text);
-      layout.height = layout.lineHeight * this.lineCount;
-    } else {
-      this.lineCount = this.getLineCount(this.text);
+    try {
+      if (layout.autoResize === spec.TextSizeMode.autoWidth) {
+        layout.width = this.getTextWidth();
+        this.lineCount = this.getLineCount(this.text);
+        layout.height = layout.lineHeight * this.lineCount;
+      } else if (layout.autoResize === spec.TextSizeMode.autoHeight) {
+        this.lineCount = this.getLineCount(this.text);
+        layout.height = layout.lineHeight * this.lineCount;
+      } else {
+        this.lineCount = this.getLineCount(this.text);
+      }
+      this.validateMetrics();
+    } catch (error) {
+      // 超限的计算结果不能阻止后续合法内容重新排版。
+      layout.width = width;
+      layout.height = height;
+      this.lineCount = lineCount;
+      this.maxLineWidth = maxLineWidth;
+      throw error;
     }
+    const scaleFactor = 0.11092565;
 
+    this.transform.setSize((layout.width + style.fontOffset) * scaleFactor * scaleFactor, layout.height * scaleFactor * scaleFactor);
+    this.layoutDirty = false;
+    this.updateMaterialSize();
+  }
+
+  private getRasterizationOptions (): Required<TextRasterizationOptions> {
+    return resolveTextRasterizationOptions(this.engine.options.textRasterization, this.rasterizationOptions);
+  }
+
+  /** 在调用 measureText 或分配画布前，校验导入数据和直接修改的样式。 */
+  private validateMetrics (): void {
+    const style = this.textStyle;
+    const layout = this.textLayout;
+    const limit = this.getRasterizationOptions().maxLogicalSize;
+    const nonnegative = [layout.width, layout.height, style.outlineWidth, style.shadowBlur];
+    const positive = [style.fontSize, layout.lineHeight];
+    const signed = [style.fontOffset, style.shadowOffsetX, style.shadowOffsetY, layout.letterSpace];
+
+    if (!nonnegative.every(value => Number.isFinite(value) && value >= 0 && value <= limit)
+      || !positive.every(value => Number.isFinite(value) && value > 0 && value <= limit)
+      || !signed.every(value => Number.isFinite(value) && Math.abs(value) <= limit)
+      || !Number.isFinite(style.fontScale) || style.fontScale <= 0
+      || layout.width + style.fontOffset < 0) {
+      throw new RangeError('Invalid text layout or style metrics.');
+    }
+  }
+
+  /** 除非显式刷新，否则每次绘制最多对最新布局进行一次栅格化。 */
+  protected updateTexture (flipY = true): void {
+    if (!this.isDirty || this.textDestroyed || !this.context || !this.canvas) {
+      return;
+    }
+    // 分配失败后，只有再次编辑并显式标记为待更新时才会重试。
+    this.dirty = false;
+    this.updateLayout();
+    // 仅像素失效时也要校验新的分辨率、样式及资源限制。
+    this.validateMetrics();
+    const style = this.textStyle;
+    const layout = this.textLayout;
     const baseWidth = layout.width + style.fontOffset;
     const baseHeight = layout.height;
 
@@ -333,31 +475,26 @@ export class TextComponent extends MaskableGraphic {
     const char = Array.from(this.text || '');
 
     const { padL, padR, padT, padB } = this.getEffectPadding();
-    const hasEffect = (padL | padR | padT | padB) !== 0;
+    const hasEffect = padL + padR + padT + padB > 0;
 
     // 限制 fontScale，确保纹理尺寸不超过 maxTextureSize / 2
-    const maxTexSize = this.engine.displayServer.renderingDevice.gpuCapability.detail.maxTextureSize / 2;
+    const maxTexSize = this.engine.displayServer.renderingDevice.gpuCapability.detail.maxTextureSize;
     const logicalWidth = hasEffect ? baseWidth + padL + padR : baseWidth;
     const logicalHeight = hasEffect ? baseHeight + padT + padB : baseHeight;
-    const maxLogical = Math.max(logicalWidth, logicalHeight, 1);
-
-    fontScale = Math.min(fontScale, maxTexSize / maxLogical);
-
-    const texWidth = Math.ceil(logicalWidth * fontScale);
-    const texHeight = Math.ceil(logicalHeight * fontScale);
+    const { width: texWidth, height: texHeight, scale: fontScale } = getTextRasterSize(
+      logicalWidth, logicalHeight, style.fontScale, maxTexSize, this.getRasterizationOptions(), this.rasterizationMode === 'preview',
+    );
 
     const shiftX = hasEffect ? padL : 0;
     const shiftY = hasEffect ? (flipY ? padT : padB) : 0;
 
     // 给渲染层用：扩容比例
-    this.effectScaleX = baseWidth > 0 ? (texWidth / (baseWidth * fontScale)) : 1;
-    this.effectScaleY = baseHeight > 0 ? (texHeight / (baseHeight * fontScale)) : 1;
+    const effectScaleX = baseWidth > 0 ? (texWidth / (baseWidth * fontScale)) : 1;
+    const effectScaleY = baseHeight > 0 ? (texHeight / (baseHeight * fontScale)) : 1;
 
-    // 默认 camera 下的 world per pixel
-    const scaleFactor = 0.11092565;
-    const scaleFactor2 = scaleFactor * scaleFactor;
-
-    this.transform.setSize(baseWidth * scaleFactor2, baseHeight * scaleFactor2);
+    if (!Number.isFinite(effectScaleX) || !Number.isFinite(effectScaleY)) {
+      throw new RangeError('Text rasterization scale cannot represent the material size.');
+    }
 
     this.renderToTexture(texWidth, texHeight, flipY, context => {
       context.scale(fontScale, fontScale);
@@ -516,9 +653,10 @@ export class TextComponent extends MaskableGraphic {
       if (hasOutline) {
         // 有描边：在描边时启用阴影
         if (style.hasShadow) {
-          this.setupShadow();
+          this.setupShadow(fontScale, flipY);
         }
-        this.setupOutline(fontScale);
+        // Canvas 已应用实际缩放倍率，描边宽度仍使用逻辑像素。
+        this.setupOutline();
 
         charsInfo.forEach(charInfo => {
           const drawY = shiftY + charInfo.y;
@@ -554,7 +692,7 @@ export class TextComponent extends MaskableGraphic {
 
       // 填充阶段：无描边时才启用阴影
       if (!hasOutline && style.hasShadow) {
-        this.setupShadow();
+        this.setupShadow(fontScale, flipY);
       }
 
       charsInfo.forEach(charInfo => {
@@ -587,9 +725,12 @@ export class TextComponent extends MaskableGraphic {
       if (style.hasShadow) {
         context.shadowColor = 'transparent';
       }
-    });
+    }, { reuse: true });
 
-    this.isDirty = false;
+    this.effectScaleX = effectScaleX;
+    this.effectScaleY = effectScaleY;
+    this.rasterizationPreview.markRasterized();
+    this.updateMaterialSize();
   }
 
   renderText (options: spec.TextContentOptions) {
@@ -639,6 +780,7 @@ export class TextComponent extends MaskableGraphic {
    * @param value - 文本框宽度
    */
   setTextWidth (value: number): void {
+    if (!Number.isFinite(Number(value))) { return; }
     const width = Math.max(0, Number(value) || 0);
     const layout = this.textLayout;
 
@@ -663,6 +805,7 @@ export class TextComponent extends MaskableGraphic {
    * @param value - 文本框高度
    */
   setTextHeight (value: number): void {
+    if (!Number.isFinite(Number(value))) { return; }
     const height = Math.max(0, Number(value) || 0);
 
     if (height === 0) {
@@ -685,6 +828,7 @@ export class TextComponent extends MaskableGraphic {
    * @default 40
    */
   setFontSize (value: number): void {
+    if (!Number.isFinite(Number(value))) { return; }
     const size = Math.max(1, Number(value) || 1);
 
     if (this.textStyle.fontSize === size) {
@@ -701,13 +845,14 @@ export class TextComponent extends MaskableGraphic {
    * @default 0
    */
   setOutlineWidth (value: number): void {
+    if (!Number.isFinite(Number(value))) { return; }
     const v = Math.max(0, Number(value) || 0);
 
     if (this.textStyle.outlineWidth === v) {
       return;
     }
     this.textStyle.outlineWidth = v;
-    this.isDirty = true;
+    this.markTextureDirty();
   }
 
   /**
@@ -719,7 +864,7 @@ export class TextComponent extends MaskableGraphic {
       return;
     }
     this.textStyle.isOutlined = value;
-    this.isDirty = true;
+    this.markTextureDirty();
   }
 
   /**
@@ -728,18 +873,18 @@ export class TextComponent extends MaskableGraphic {
    * @default 0
    */
   setShadowBlur (value: number): void {
+    if (!Number.isFinite(Number(value))) { return; }
     const v = Math.max(0, Number(value) || 0);
 
     if (this.textStyle.shadowBlur === v) {
       return;
     }
     this.textStyle.shadowBlur = v;
-    this.isDirty = true;
+    this.markTextureDirty();
   }
 
   /**
    * 设置阴影颜色
-   * > setupShadow 使用 outlineColor 作为阴影颜色，更新 shadowColor 不影响阴影颜色
    * @param value - 阴影颜色
    * @returns
    */
@@ -750,7 +895,7 @@ export class TextComponent extends MaskableGraphic {
       return;
     }
     this.textStyle.shadowColor = v;
-    this.isDirty = true;
+    this.markTextureDirty();
   }
 
   /**
@@ -759,13 +904,14 @@ export class TextComponent extends MaskableGraphic {
    * @returns
    */
   setShadowOffsetX (value: number): void {
+    if (!Number.isFinite(Number(value))) { return; }
     const v = Number(value) || 0;
 
     if (this.textStyle.shadowOffsetX === v) {
       return;
     }
     this.textStyle.shadowOffsetX = v;
-    this.isDirty = true;
+    this.markTextureDirty();
   }
 
   /**
@@ -774,13 +920,14 @@ export class TextComponent extends MaskableGraphic {
    * @returns
    */
   setShadowOffsetY (value: number): void {
+    if (!Number.isFinite(Number(value))) { return; }
     const v = Number(value) || 0;
 
     if (this.textStyle.shadowOffsetY === v) {
       return;
     }
     this.textStyle.shadowOffsetY = v;
-    this.isDirty = true;
+    this.markTextureDirty();
   }
 
   /**
@@ -794,6 +941,7 @@ export class TextComponent extends MaskableGraphic {
    * @returns 文本宽度（>= 0）
    */
   getTextWidth (): number {
+    this.validateMetrics();
     const ctx = this.context;
 
     if (!ctx) { return this.textLayout?.width ?? 0; }

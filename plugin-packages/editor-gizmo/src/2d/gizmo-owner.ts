@@ -1,3 +1,4 @@
+import type { GizmoHostPolicy } from './host-policy';
 import type { Vector2 } from './math';
 import type { FrameManager } from './frame/frame-manager';
 import type { Selection } from './selection/selection';
@@ -10,12 +11,19 @@ import type { GizmoOwnerEvents } from './gizmo-action';
 import type { LoadingManager } from './gizmos/loading-manager';
 import type { GestureCursorResult } from './cursor';
 import type { EditMode } from './modes';
+import type { Gizmo } from './gizmo';
 
 /** 独立于指针捕获者的选区变换状态。 */
 export type SelectionTransformKind = 'idle' | 'move' | 'resize';
 
 /** Gizmo 访问宿主输入、选区、视口和共享服务的接口。 */
 export interface GizmoOwner {
+  /** Optional restrictions supplied by the document owner. */
+  getHostPolicy?(): Readonly<GizmoHostPolicy>,
+
+  /** 合并当前交互的绘制请求，下一帧执行最新回调并隔离错误。 */
+  requestDraw?(source: Gizmo, draw: () => void): void,
+
   /**
    * 发出 Gizmo 业务事件。
    * @param eventName 事件名称

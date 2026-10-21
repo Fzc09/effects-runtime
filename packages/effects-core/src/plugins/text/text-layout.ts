@@ -37,7 +37,7 @@ export class TextLayout implements BaseLayout {
       textVerticalAlign = spec.TextVerticalAlign.top,
       textAlign = spec.TextAlignment.left,
       letterSpace = 0,
-      fontSize,
+      fontSize = 40,
       lineHeight = fontSize,
       autoResize = spec.TextSizeMode.fixed,
       keepWordIntact = true,

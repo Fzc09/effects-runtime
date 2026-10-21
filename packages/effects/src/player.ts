@@ -188,6 +188,7 @@ export class Player extends EventEmitter<PlayerEvent<Player>> implements Disposa
         pixelRatio: Number.isFinite(pixelRatio) ? pixelRatio as number : getPixelRatio(),
         doNotHandleContextLost,
         ownsCanvas,
+        textRasterization: config.textRasterization,
       });
       this.engine.displayServer.offscreenMode = true;
 

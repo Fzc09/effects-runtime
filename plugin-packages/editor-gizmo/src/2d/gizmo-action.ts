@@ -1,3 +1,4 @@
+import type { GizmoTransformSessionEvent } from './host-policy';
 import type { Gizmo } from './gizmo';
 import type { FrameCreateData, ItemCreateType, TextCreateData } from './gizmos/item-create-gizmo';
 import type { AutoLayoutChangeInfo } from './frame/frame-assisted-layout';
@@ -165,6 +166,10 @@ export type GizmoActionLifecycleEvent =
 
 /** GizmoOwner 发出的事件及其参数。 */
 export type GizmoOwnerEvents = {
+  transformstart: [GizmoTransformSessionEvent],
+  transformupdate: [GizmoTransformSessionEvent],
+  transformcommit: [GizmoTransformSessionEvent],
+  transformcancel: [GizmoTransformSessionEvent],
   /** 键盘按下事件。 */
   keyDown: [InputEventKey],
   /** 键盘抬起事件。 */

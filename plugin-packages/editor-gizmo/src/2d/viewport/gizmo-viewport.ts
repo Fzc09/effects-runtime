@@ -209,6 +209,13 @@ export class GizmoViewport extends Control {
     return event;
   }
 
+  /** Cancel pointer capture state without synthesizing a mouse-up/commit. */
+  cancelPointer (): void {
+    this.mouseButtonMask = MouseButtonMask.None;
+    this.dragThresholdState = DragThresholdState.Idle;
+    this.shiftPressed = this.altPressed = this.metaPressed = this.ctrlPressed = false;
+  }
+
   /** 释放回调和输入状态。 */
   override onDestroy (): void {
     this.onMouseEnterCallback = null;

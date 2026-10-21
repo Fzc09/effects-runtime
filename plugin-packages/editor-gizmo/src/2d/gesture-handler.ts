@@ -1,3 +1,8 @@
+import { registerItemGeometry } from './host-policy';
+import { Box2 } from '@galacean/effects-math/es/extension/index';
+import { ViewportOverlayGizmo } from './gizmos/viewport-overlay-gizmo';
+import { snapshotGizmoTransform, restoreGizmoTransform, type GizmoHostPolicy, type GizmoTransformSnapshot, type GizmoTransformSessionEvent } from './host-policy';
+import type { VFXItem } from '@galacean/effects';
 import { type Engine, type InputEvent, type InputEventKey, type InputEventMouse, type InputEventMouseButton, type InputEventMouseMotion } from '@galacean/effects';
 import { Control, MouseFilter, type ControlEvent } from '@galacean/effects-plugin-gui';
 import { cursorMap, loadCursorIcons } from './cursor-icons';
@@ -100,6 +105,94 @@ export class GestureHandler extends Control implements GizmoOwner {
   /** 选中状态与命中查询器。 */
   private selection: Selection;
 
+  private nextTransformSessionId = 0;
+  private pendingDraw?: { source: Gizmo, draw: () => void, request: number };
+  private transformSession?: {
+    id: number,
+    source: Gizmo,
+    items: VFXItem[],
+    before: readonly GizmoTransformSnapshot[],
+  };
+
+  /** Host restrictions are optional so existing Artis editors retain their behavior. */
+  getHostPolicy (): Readonly<GizmoHostPolicy> {
+    return this.hostPolicy;
+  }
+
+  /** Cancel a preview without emitting actioncommit or changing host document data. */
+  cancelInteraction (reason = 'host'): void {
+    const session = this.transformSession;
+    const captured = this.capturedGizmo;
+
+    this.cancelPendingDraw();
+    this.transformSession = undefined;
+    this.clearCapturedGizmo();
+    this.gizmoViewport?.cancelPointer();
+    this.selectionTransformKind = 'idle';
+    this.snapManager.reset();
+    try {
+      session?.items.forEach((item, index) => {
+        try {
+          restoreGizmoTransform(item, session.before[index]);
+        } catch (error) {
+          this.handleGizmoError(error, 'gizmo-actionupdate', session.source.type);
+        }
+      });
+      const gizmos = new Set(this.gizmoManager.activeGizmos);
+
+      if (captured) { gizmos.add(captured); }
+      if (session) { gizmos.add(session.source); }
+      for (const gizmo of gizmos) { this.cancelGizmo(gizmo, reason); }
+      this.rebuildGizmos();
+      this.disposeQueuedGizmos();
+    } finally {
+      // 会话已在调用外部代码前分离；清理失败也必须向宿主结束该事务。
+      if (session) {
+        this.emit('transformcancel', {
+          sessionId: session.id,
+          before: session.before,
+          after: session.before,
+          reason,
+        });
+      }
+    }
+  }
+
+  /** 当前交互在一帧内只呈现最后一次修改；结束交互时由 Gizmo 同步刷新。 */
+  requestDraw (source: Gizmo, draw: () => void): void {
+    if (this.pendingDraw) {
+      this.pendingDraw.source = source;
+      this.pendingDraw.draw = draw;
+
+      return;
+    }
+    const pending = { source, draw, request: 0 };
+
+    pending.request = requestAnimationFrame(() => {
+      if (this.pendingDraw !== pending) { return; }
+      this.pendingDraw = undefined;
+      try {
+        pending.draw();
+      } catch (error) {
+        this.cancelFailedInteraction(error, 'gizmo-actionupdate', pending.source);
+      }
+    });
+    this.pendingDraw = pending;
+  }
+
+  private cancelPendingDraw (): void {
+    if (this.pendingDraw) {
+      cancelAnimationFrame(this.pendingDraw.request);
+      this.pendingDraw = undefined;
+    }
+  }
+
+  private readonly onInputBlur = (): void => {
+    if (this.capturedGizmo && (this.hostPolicy.transactionalTransforms || this.capturedGizmo.cancelOnToolChange)) {
+      this.cancelInteraction('blur');
+    }
+  };
+
   /** 当前 hover 的元素；用于在目标切换、离开或销毁时结束媒体预览。 */
   private hoveredMediaItemId: string | undefined;
 
@@ -142,7 +235,9 @@ export class GestureHandler extends Control implements GizmoOwner {
    * 创建手势处理器并装配基础交互状态。
    * @param engine Effects 引擎。
    */
-  constructor (engine: Engine) {
+  private releaseItemGeometry?: () => void;
+
+  constructor (engine: Engine, private readonly hostPolicy: Readonly<GizmoHostPolicy> = {}) {
     super(engine);
     this.mouseFilter = MouseFilter.Pass;
     this.mouseForcePassScrollEvents = false;
@@ -150,12 +245,16 @@ export class GestureHandler extends Control implements GizmoOwner {
     this.frameManager = new FrameManager(engine);
     this.gizmoManager = new GizmoManager();
     this.viewportNavigation = new ViewportNavigationController(this);
-    this.selection = new Selection(engine, this.hoveringResults);
+    this.releaseItemGeometry = hostPolicy.itemGeometry ? registerItemGeometry(engine, hostPolicy.itemGeometry) : undefined;
+    this.selection = new Selection(engine, this.hoveringResults, hostPolicy.isSelectable);
     this.snapManager = new SnapManager(this);
     this.editMode = this.createDefaultEditMode();
 
     this.selection.on('preselectchange', this.onPreselectChange);
     this.createViewport();
+    window.addEventListener('blur', this.onInputBlur);
+    // 先取消预览，再让 InputServer 的失焦处理合成抬起事件，避免误提交。
+    engine.canvas.addEventListener('blur', this.onInputBlur, true);
     void loadCursorIcons();
   }
 
@@ -186,6 +285,37 @@ export class GestureHandler extends Control implements GizmoOwner {
     // Control does not expose emit yet; use its existing event storage.
     const emitter = (this as any).eventEmitter;
 
+    const action = args[0];
+
+    if (this.hostPolicy.transactionalTransforms && action && 'transformType' in action) {
+      if (eventName === 'actionstart') {
+        const items = this.selection.getSelectedPlayerItems();
+
+        this.transformSession = {
+          id: ++this.nextTransformSessionId,
+          source: action.source,
+          items,
+          before: Object.freeze(items.map(snapshotGizmoTransform)),
+        };
+      }
+      const session = this.transformSession;
+
+      if (session && session.source === action.source) {
+        const snapshot: GizmoTransformSessionEvent = {
+          sessionId: session.id,
+          before: session.before,
+          after: Object.freeze(session.items.map(snapshotGizmoTransform)),
+        };
+
+        // Detach before calling external code: a commit listener may load another scene.
+        if (eventName === 'actioncommit') {
+          this.transformSession = undefined;
+        }
+        if (eventName === 'actionstart') { emitter.emit('transformstart', snapshot); }
+        if (eventName === 'actionupdate') { emitter.emit('transformupdate', snapshot); }
+        if (eventName === 'actioncommit') { emitter.emit('transformcommit', snapshot); }
+      }
+    }
     emitter.emit(eventName, ...args);
   }
 
@@ -201,6 +331,9 @@ export class GestureHandler extends Control implements GizmoOwner {
   set ignoreInteraction (state: boolean) {
     if (state === this._ignoreInteraction) {
       return;
+    }
+    if (state && (this.hostPolicy.transactionalTransforms || this.capturedGizmo?.cancelOnToolChange)) {
+      this.cancelInteraction('disabled');
     }
     this._ignoreInteraction = state;
   }
@@ -255,6 +388,9 @@ export class GestureHandler extends Control implements GizmoOwner {
   setActiveEditMode (mode: EditMode): void {
     if (mode === this.editMode) {
       return;
+    }
+    if (this.hostPolicy.transactionalTransforms || this.capturedGizmo?.cancelOnToolChange) {
+      this.cancelInteraction('edit-mode');
     }
     this.commitEditMode(mode);
     this.redispatchMouseAtCurrentPosition();
@@ -356,6 +492,9 @@ export class GestureHandler extends Control implements GizmoOwner {
    * @param gizmoTool 新活动工具。
    */
   setActiveTool (gizmoTool: GizmoTool): void {
+    if (this.hostPolicy.transactionalTransforms || this.capturedGizmo?.cancelOnToolChange) {
+      this.cancelInteraction('tool');
+    }
     this.activeGizmoTool = gizmoTool;
     this.commitEditMode(this.resolveEditModeForTool(gizmoTool));
     this.disposeQueuedGizmos();
@@ -371,6 +510,12 @@ export class GestureHandler extends Control implements GizmoOwner {
 
   /** 释放资源：解绑订阅、清交互状态，并销毁当前 Gizmo 图。 */
   override onDestroy (): void {
+    window.removeEventListener('blur', this.onInputBlur);
+    this.engine.canvas.removeEventListener('blur', this.onInputBlur, true);
+    this.cancelPendingDraw();
+    if (this.hostPolicy.transactionalTransforms || this.capturedGizmo?.cancelOnToolChange) {
+      this.cancelInteraction('dispose');
+    }
     this.editMode.onExit?.();
     this.clearCapturedGizmo();
     this.selection.off('preselectchange', this.onPreselectChange);
@@ -383,6 +528,8 @@ export class GestureHandler extends Control implements GizmoOwner {
     this.disposeQueuedGizmos();
     this.gizmoManager.dispose();
     this.viewportNavigation.dispose();
+    this.releaseItemGeometry?.();
+    this.releaseItemGeometry = undefined;
 
     this.selectionTransformKind = 'idle';
     this.setCursor({ type: GestureCursorType.NORMAL, angle: 0 });
@@ -512,6 +659,10 @@ export class GestureHandler extends Control implements GizmoOwner {
         case ControlInputPhase.KeyDown: {
           const event = input as InputEventKey;
 
+          if ((this.hostPolicy.transactionalTransforms || this.capturedGizmo?.cancelOnToolChange) && event.physicalKeycode.toLowerCase() === 'escape') {
+            this.cancelInteraction('escape');
+            event.accept();
+          }
           this.emit('keyDown', event);
           if (!event.isAccepted()) {
             this.handleKeyboardEvent(event, 'down');
@@ -537,7 +688,21 @@ export class GestureHandler extends Control implements GizmoOwner {
 
   /** @returns 所有工具共享的视口 Gizmo。 */
   private createCommonBeforeToolSwitch (): Gizmo[] {
+    const overlays: Gizmo[] = [];
+
+    if (this.hostPolicy.viewportBounds) {
+      const overlay = new ViewportOverlayGizmo(this);
+
+      overlay.mainViewportBoxProvider = () => {
+        const bounds = this.hostPolicy.viewportBounds?.();
+
+        return bounds ? new Box2(new Vector2(bounds[0], bounds[1]), new Vector2(bounds[0] + bounds[2], bounds[1] + bounds[3])) : null;
+      };
+      overlays.push(overlay);
+    }
+
     return [
+      ...overlays,
       new HandGizmo(this),
       new IconGizmo(this),
       new LoadingGizmo(this, this.loadingManager),
@@ -708,7 +873,7 @@ export class GestureHandler extends Control implements GizmoOwner {
     try {
       gizmo.prepareForDispatch?.();
     } catch (error) {
-      this.handleGizmoError(error, this.errorPhaseFor(phase), gizmo.type);
+      this.cancelFailedInteraction(error, this.errorPhaseFor(phase), gizmo);
     }
   }
 
@@ -751,10 +916,33 @@ export class GestureHandler extends Control implements GizmoOwner {
       }
     } catch (error) {
       event.clearAccepted();
-      this.handleGizmoError(error, this.errorPhaseFor(phase), gizmo.type);
+      this.cancelFailedInteraction(error, this.errorPhaseFor(phase), gizmo);
     }
 
     return event.isAccepted();
+  }
+
+  /** 同步输入与异步绘制共用事务取消路径，保留原始错误和清理错误。 */
+  private cancelFailedInteraction (error: unknown, phase: GizmoErrorPhase, source: Gizmo): void {
+    try {
+      if (this.transformSession) {
+        this.cancelInteraction('gizmo-error');
+      } else {
+        this.cancelGizmo(source, 'gizmo-error');
+      }
+    } catch (cleanupError) {
+      this.handleGizmoError(cleanupError, phase, source.type);
+    }
+    this.handleGizmoError(error, phase, source.type);
+  }
+
+  /** 清理失败也必须继续释放捕获、处理其他 Gizmo 并上报原始错误。 */
+  private cancelGizmo (gizmo: Gizmo, reason: string): void {
+    try {
+      gizmo.onCancel(reason);
+    } catch (error) {
+      this.handleGizmoError(error, 'gizmo-actionupdate', gizmo.type);
+    }
   }
 
   /**
@@ -775,7 +963,7 @@ export class GestureHandler extends Control implements GizmoOwner {
         }
       } catch (error) {
         event.clearAccepted();
-        this.handleGizmoError(error, 'gizmo-key', gizmo.type);
+        this.cancelFailedInteraction(error, 'gizmo-key', gizmo);
       }
       if (event.isAccepted()) {
         break;
@@ -895,10 +1083,15 @@ export class GestureHandler extends Control implements GizmoOwner {
     phase: GizmoErrorPhase,
     gizmoType?: string,
   ): void {
-    this.errorMonitor?.report(error, phase, { gizmoType });
-
+    this.cancelPendingDraw();
     this.clearCapturedGizmo();
+    this.gizmoViewport?.cancelPointer();
     this.selectionTransformKind = 'idle';
     this.snapManager.reset();
+    try {
+      this.errorMonitor?.report(error, phase, { gizmoType });
+    } catch (reportError) {
+      console.error('Gizmo error reporting failed.', reportError);
+    }
   }
 }

@@ -140,6 +140,42 @@ function createGizmo (
 }
 
 describe('ResizeSelectionGizmo - handles only', () => {
+  it('等比或旋转边缩放沿约束直线吸附，只保留实际命中的提示轴', () => {
+    const { gizmo, owner } = createGizmo(TransformType.SCALE);
+    const snap = owner.getSnapManager();
+    const removeVertical = snap.registerGuideProvider(() => [{ axis: 'x', coordinate: 430 }]);
+    const snapHandlePoint = (gizmo as unknown as {
+      snapHandlePoint: (point: Vector2, direction: Vector2) => Vector2,
+    }).snapHandlePoint.bind(gizmo);
+
+    expect(snapHandlePoint(new Vector2(432, 359), new Vector2(4, 3))).to.deep.equal(new Vector2(430, 357.5));
+    expect(snap.result.x).to.equal(0);
+    expect(snap.result.y).to.equal(undefined);
+    snap.registerGuideProvider(() => [{ axis: 'y', coordinate: 360 }]);
+    const point = snapHandlePoint(new Vector2(432, 359), new Vector2(4, 3));
+
+    expect(point.x).to.be.closeTo(433 + 1 / 3, 1e-6);
+    expect(point.y).to.equal(360);
+    expect(snap.result.x).to.equal(undefined);
+    expect(snap.result.y).to.equal(0);
+    removeVertical();
+  });
+
+  it('约束方向无法在阈值内到达参考线时不吸附，也不显示虚假命中', () => {
+    const { gizmo, owner } = createGizmo(TransformType.SCALE);
+    const snap = owner.getSnapManager();
+
+    snap.registerGuideProvider(() => [{ axis: 'x', coordinate: 430 }]);
+    const snapHandlePoint = (gizmo as unknown as {
+      snapHandlePoint: (point: Vector2, direction: Vector2) => Vector2,
+    }).snapHandlePoint.bind(gizmo);
+    const point = new Vector2(432, 359);
+
+    expect(snapHandlePoint(point, new Vector2(1, 100))).to.deep.equal(point);
+    expect(snap.result).to.deep.equal({});
+    expect(snap.getSnappingVisualizations()).to.deep.equal([]);
+  });
+
   it('选区包含 loading 元素时保留选框但禁用缩放手柄与命中', () => {
     const { gizmo, loadingManager, emit } = createGizmo(TransformType.SCALE);
 
@@ -387,6 +423,7 @@ describe('ResizeSelectionGizmo - handles only', () => {
       setLineHeight: chai.spy(),
       setTextWidth: chai.spy(),
       setTextHeight: chai.spy(),
+      refreshText: chai.spy(),
       getLineCount: chai.spy(() => 2),
     } as unknown as TextComponent;
     const transform = {
@@ -439,6 +476,43 @@ describe('ResizeSelectionGizmo - handles only', () => {
     expect(getSpyCalls(transform.setPosition).at(-1)).to.deep.equal([15, 15, 0]);
   });
 
+  it('取消文字缩放精确恢复分数字号、低行高和零高度', () => {
+    const { gizmo, owner, emit } = createGizmo(TransformType.SCALE);
+    const component = {
+      textStyle: { fontSize: 60, fontOffset: 10 },
+      textLayout: { width: 200, height: 100, lineHeight: 72, autoResize: spec.TextSizeMode.autoHeight },
+      refreshText: chai.spy(),
+      flushText: chai.spy(),
+    } as unknown as TextComponent;
+    let previewActive = true;
+    const end = Object.assign(() => { previewActive = false; }, { isActive: () => previewActive });
+    const transform = { setPosition: chai.spy(), setScale: chai.spy() };
+    const internal = gizmo as unknown as { resizeSession: unknown, handlesActive: boolean };
+
+    internal.resizeSession = {
+      item: { transform },
+      initialPosition: new Vector3(10, 20, 0),
+      initialScale: new Vector3(1, 2, 1),
+      endRasterizationPreview: end,
+      text: { component, fontSize: 40.5, fontOffset: 0.25, lineHeight: 20, width: 100.5, height: 0, autoResize: spec.TextSizeMode.fixed },
+    };
+    internal.handlesActive = true;
+    owner.setSelectionTransformKind('resize');
+    gizmo.onCancel('escape');
+    expect(component.textStyle).deep.equals({ fontSize: 40.5, fontOffset: 0.25 });
+    expect(component.textLayout).deep.equals({ width: 100.5, height: 0, lineHeight: 20, autoResize: spec.TextSizeMode.fixed });
+    expect(transform.setPosition).to.have.been.called.with(10, 20, 0);
+    expect(transform.setScale).to.have.been.called.with(1, 2, 1);
+    expect(component.refreshText).to.have.been.called.once;
+    expect(component.flushText).to.have.been.called.once;
+    expect(previewActive).equals(false);
+    expect(internal.handlesActive).equals(false);
+    expect(owner.getSelectionTransformKind()).equals('idle');
+    expect(emit).not.to.have.been.called;
+    gizmo.onCancel('dispose');
+    expect(component.flushText).to.have.been.called.once;
+  });
+
   it('收窄换行后连续拖动角点，分数高度不会改变文字宽高比', () => {
     const { gizmo } = createGizmo(TransformType.NULL);
     const component = {
@@ -447,6 +521,7 @@ describe('ResizeSelectionGizmo - handles only', () => {
       setLineHeight: chai.spy(),
       setTextWidth: chai.spy(),
       setTextHeight: chai.spy(),
+      refreshText: chai.spy(),
       getLineCount: chai.spy(() => 3),
     };
     const transform = { setScale: chai.spy(), setPosition: chai.spy() };
@@ -495,6 +570,7 @@ describe('ResizeSelectionGizmo - handles only', () => {
       setLineHeight: chai.spy(),
       setTextWidth: chai.spy(),
       setTextHeight: chai.spy(),
+      refreshText: chai.spy(),
     };
     const transform = {
       setScale: chai.spy(),
@@ -551,6 +627,7 @@ describe('ResizeSelectionGizmo - handles only', () => {
       text: 'text',
       setTextWidth: chai.spy(),
       setTextHeight: chai.spy(),
+      refreshText: chai.spy(),
       getLineCount: chai.spy(() => 1),
     };
     const transform = {
@@ -604,6 +681,7 @@ describe('ResizeSelectionGizmo - handles only', () => {
       setLineHeight: chai.spy(),
       setTextWidth: chai.spy(),
       setTextHeight: chai.spy(),
+      refreshText: chai.spy(),
     };
     const transform = {
       setScale: chai.spy(),
